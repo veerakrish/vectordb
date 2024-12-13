@@ -60,6 +60,11 @@ class HNSWIndex:
         # Recreate the lock
         self._init_lock()
 
+    def get_ids(self) -> List[str]:
+        """Get all item IDs in the index."""
+        with self._lock:
+            return list(self.nodes.keys())
+
     def _distance(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
         """Calculate distance between two vectors."""
         if self.distance_metric == "cosine":
@@ -158,11 +163,6 @@ class HNSWIndex:
             # Update entry point if necessary
             if level > len(self.nodes[self.entry_point].neighbors):
                 self.entry_point = id
-
-    def get_ids(self) -> List[str]:
-        """Get all item IDs in the index."""
-        with self._lock:
-            return list(self.nodes.keys())
 
     def remove_item(self, id: str) -> None:
         """Remove an item from the index."""

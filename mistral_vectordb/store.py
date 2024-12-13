@@ -1,361 +1,444 @@
-"""Main vector store implementation."""
+"""Vector store implementation with persistence and ACID compliance."""
 
+import pickle
 import json
-import os
 import shutil
+import threading
+import logging
 import time
-from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, Any, Iterator
-
-import hnswlib
+from typing import List, Dict, Any, Tuple, Optional, Callable
 import numpy as np
-from tqdm import tqdm
+import heapq
 
-from .types import SearchResult, Transaction, VectorMetadata
+logger = logging.getLogger(__name__)
+
+class Node:
+    """Node in the HNSW graph."""
+    def __init__(self, id: str, vector: np.ndarray, metadata: Dict[str, Any]):
+        self.id = id
+        self.vector = vector
+        self.metadata = metadata
+        self.neighbors: Dict[int, List[str]] = {}  # layer -> list of neighbor ids
+
+class HNSWIndex:
+    """Hierarchical Navigable Small World Index implementation."""
+    
+    def __init__(
+        self,
+        dim: int,
+        M: int = 16,  # Max number of connections per node
+        ef_construction: int = 200,  # Size of dynamic candidate list
+        max_layers: int = 4,
+        distance_metric: str = "cosine"
+    ):
+        self.dim = dim
+        self.M = M
+        self.ef_construction = ef_construction
+        self.max_layers = max_layers
+        self.distance_metric = distance_metric
+        self.nodes: Dict[str, Node] = {}
+        self.entry_point: Optional[str] = None
+        self.lock = threading.Lock()
+    
+    def _distance(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
+        """Calculate distance between two vectors."""
+        if self.distance_metric == "cosine":
+            return 1 - np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+        elif self.distance_metric == "euclidean":
+            return np.linalg.norm(vec1 - vec2)
+        else:
+            raise ValueError(f"Unsupported distance metric: {self.distance_metric}")
+
+    def _get_random_level(self) -> int:
+        """Generate random level for a new node."""
+        level = 0
+        while np.random.random() < 0.5 and level < self.max_layers - 1:
+            level += 1
+        return level
+
+    def add_item(self, id: str, vector: np.ndarray, metadata: Dict[str, Any]) -> None:
+        """Add an item to the index."""
+        with self.lock:
+            if len(vector.shape) != 1 or vector.shape[0] != self.dim:
+                raise ValueError(f"Vector dimension mismatch. Expected {self.dim}, got {vector.shape}")
+            
+            # Create new node
+            node = Node(id, vector, metadata)
+            level = self._get_random_level()
+            
+            # If this is the first node
+            if not self.entry_point:
+                self.nodes[id] = node
+                self.entry_point = id
+                return
+            
+            # Find entry points for each layer
+            curr_node_id = self.entry_point
+            curr_dist = self._distance(vector, self.nodes[curr_node_id].vector)
+            
+            # Search from top to bottom
+            for layer in range(len(self.nodes[self.entry_point].neighbors), -1, -1):
+                while True:
+                    changed = False
+                    
+                    # Check neighbors at current layer
+                    curr_node = self.nodes[curr_node_id]
+                    if layer in curr_node.neighbors:
+                        for neighbor_id in curr_node.neighbors[layer]:
+                            if neighbor_id not in self.nodes:
+                                continue
+                            dist = self._distance(vector, self.nodes[neighbor_id].vector)
+                            if dist < curr_dist:
+                                curr_node_id = neighbor_id
+                                curr_dist = dist
+                                changed = True
+                    
+                    if not changed:
+                        break
+            
+            # Add connections for the new node
+            for layer in range(level + 1):
+                # Find nearest neighbors at this layer
+                candidates = [(curr_dist, curr_node_id)]
+                visited = {curr_node_id}
+                
+                while candidates:
+                    dist, curr_id = heapq.heappop(candidates)
+                    curr_node = self.nodes[curr_id]
+                    
+                    if layer in curr_node.neighbors:
+                        for neighbor_id in curr_node.neighbors[layer]:
+                            if neighbor_id in visited or neighbor_id not in self.nodes:
+                                continue
+                            neighbor_dist = self._distance(vector, self.nodes[neighbor_id].vector)
+                            heapq.heappush(candidates, (neighbor_dist, neighbor_id))
+                            visited.add(neighbor_id)
+                
+                # Select M nearest neighbors
+                neighbors = sorted(visited, key=lambda x: self._distance(vector, self.nodes[x].vector))[:self.M]
+                node.neighbors[layer] = neighbors
+                
+                # Add backward connections
+                for neighbor_id in neighbors:
+                    if layer not in self.nodes[neighbor_id].neighbors:
+                        self.nodes[neighbor_id].neighbors[layer] = []
+                    self.nodes[neighbor_id].neighbors[layer].append(id)
+                    # Ensure neighbor doesn't have too many connections
+                    if len(self.nodes[neighbor_id].neighbors[layer]) > self.M:
+                        # Remove connection to the furthest neighbor
+                        furthest = max(
+                            self.nodes[neighbor_id].neighbors[layer],
+                            key=lambda x: self._distance(self.nodes[neighbor_id].vector, self.nodes[x].vector)
+                        )
+                        self.nodes[neighbor_id].neighbors[layer].remove(furthest)
+            
+            # Add the node to the index
+            self.nodes[id] = node
+            
+            # Update entry point if necessary
+            if level > len(self.nodes[self.entry_point].neighbors):
+                self.entry_point = id
+
+    def get_ids(self) -> List[str]:
+        """Get all item IDs in the index."""
+        return list(self.nodes.keys())
+
+    def remove_item(self, id: str) -> None:
+        """Remove an item from the index."""
+        with self.lock:
+            if id not in self.nodes:
+                return
+            
+            # Get the node to remove
+            node = self.nodes[id]
+            
+            # Remove references to this node from its neighbors
+            for layer in node.neighbors:
+                for neighbor_id in node.neighbors[layer]:
+                    if neighbor_id in self.nodes:
+                        neighbor = self.nodes[neighbor_id]
+                        if layer in neighbor.neighbors:
+                            neighbor.neighbors[layer] = [nid for nid in neighbor.neighbors[layer] if nid != id]
+            
+            # If this is the entry point, update it
+            if self.entry_point == id:
+                if len(self.nodes) > 1:
+                    # Set a different node as entry point
+                    self.entry_point = next(nid for nid in self.nodes.keys() if nid != id)
+                else:
+                    self.entry_point = None
+            
+            # Remove the node
+            del self.nodes[id]
+
+    def search(self, query_vector: np.ndarray, k: int = 10) -> List[Tuple[float, str]]:
+        """Search for k nearest neighbors."""
+        if not self.entry_point:
+            return []
+        
+        # Start from entry point
+        curr_node_id = self.entry_point
+        curr_dist = self._distance(query_vector, self.nodes[curr_node_id].vector)
+        
+        # Search from top to bottom
+        for layer in range(len(self.nodes[self.entry_point].neighbors), -1, -1):
+            while True:
+                changed = False
+                
+                # Check neighbors at current layer
+                curr_node = self.nodes[curr_node_id]
+                if layer in curr_node.neighbors:
+                    for neighbor_id in curr_node.neighbors[layer]:
+                        if neighbor_id not in self.nodes:
+                            continue
+                        dist = self._distance(query_vector, self.nodes[neighbor_id].vector)
+                        if dist < curr_dist:
+                            curr_node_id = neighbor_id
+                            curr_dist = dist
+                            changed = True
+                
+                if not changed:
+                    break
+        
+        # Collect k nearest neighbors
+        candidates = [(curr_dist, curr_node_id)]
+        visited = {curr_node_id}
+        results = []
+        
+        while candidates and len(results) < k:
+            dist, curr_id = heapq.heappop(candidates)
+            results.append((dist, curr_id))
+            
+            # Add unvisited neighbors
+            curr_node = self.nodes[curr_id]
+            for layer in curr_node.neighbors:
+                for neighbor_id in curr_node.neighbors[layer]:
+                    if neighbor_id in visited or neighbor_id not in self.nodes:
+                        continue
+                    neighbor_dist = self._distance(query_vector, self.nodes[neighbor_id].vector)
+                    heapq.heappush(candidates, (neighbor_dist, neighbor_id))
+                    visited.add(neighbor_id)
+        
+        return results
 
 class VectorStore:
-    """High-performance vector database with HNSW indexing."""
-
+    """Vector store with HNSW indexing and persistence."""
+    
     def __init__(
         self,
         storage_dir: str,
         dim: int,
         distance_metric: str = "cosine",
-        ef_construction: int = 200,
-        M: int = 16,
-        auto_save: bool = True
+        auto_save_interval: int = 60  # seconds
     ):
-        """Initialize vector store.
-        
-        Args:
-            storage_dir: Directory for storing vectors and metadata
-            dim: Dimension of vectors
-            distance_metric: Distance metric ("cosine", "euclidean", "inner_product")
-            ef_construction: HNSW index construction parameter
-            M: HNSW index parameter
-            auto_save: Whether to automatically save after operations
-        """
         self.storage_dir = Path(storage_dir)
-        self.dim = dim
-        self.distance_metric = distance_metric
-        self.ef_construction = ef_construction
-        self.M = M
-        self.auto_save = auto_save
+        self.index = HNSWIndex(dim=dim, distance_metric=distance_metric)
+        self.auto_save_interval = auto_save_interval
+        self.last_save_time = datetime.now()
+        self.transaction_log_path = self.storage_dir / "transaction.log"
+        self.data_path = self.storage_dir / "vector_store.pkl"
+        self.metadata_path = self.storage_dir / "metadata.json"
         
-        # Create storage directory
+        # Create storage directory if it doesn't exist
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         
-        # Initialize HNSW index
-        self.index = hnswlib.Index(space=distance_metric, dim=dim)
-        self.index.init_index(
-            max_elements=1000,  # Will be resized automatically
-            ef_construction=ef_construction,
-            M=M
-        )
+        # Initialize storage
+        self._initialize_storage()
         
-        # Initialize metadata storage
-        self.metadata: Dict[str, Dict] = {}
-        self.id_to_index: Dict[str, int] = {}
-        self.index_to_id: Dict[int, str] = {}
-        self.current_index = 0
-        
-        # Load existing data if available
-        self._load_if_exists()
-    
-    def add_item(
-        self,
-        id: str,
-        vector: Union[List[float], np.ndarray],
-        metadata: Optional[Dict] = None
-    ) -> None:
-        """Add single item to store.
-        
-        Args:
-            id: Unique identifier for the vector
-            vector: Vector to store
-            metadata: Optional metadata to store with vector
-        """
-        if isinstance(vector, list):
-            vector = np.array(vector)
-        
-        if id in self.id_to_index:
-            raise ValueError(f"Item with id {id} already exists")
-        
-        # Add to index
-        self.index.add_items(vector.reshape(1, -1), [self.current_index])
-        
-        # Update mappings
-        self.id_to_index[id] = self.current_index
-        self.index_to_id[self.current_index] = id
-        if metadata:
-            self.metadata[id] = metadata
-        
-        self.current_index += 1
-        
-        if self.auto_save:
-            self.save()
-    
-    def batch_add(
-        self,
-        items: List[Tuple[Union[List[float], np.ndarray], str, Optional[Dict]]]
-    ) -> None:
-        """Add multiple items in batch.
-        
-        Args:
-            items: List of (vector, id, metadata) tuples
-        """
-        vectors = []
-        indices = []
-        
-        for vector, id, metadata in items:
-            if id in self.id_to_index:
-                raise ValueError(f"Item with id {id} already exists")
+        # Start auto-save thread if interval > 0
+        if auto_save_interval > 0:
+            self._start_auto_save()
+
+    def _initialize_storage(self) -> None:
+        """Initialize storage and recover if necessary."""
+        try:
+            if self.data_path.exists():
+                self.load()
+            if self.transaction_log_path.exists():
+                self._replay_transaction_log()
+        except Exception as e:
+            logger.error(f"Error initializing storage: {e}")
+            raise
+
+    def _log_transaction(self, operation: str, data: Dict[str, Any]) -> None:
+        """Log transaction for recovery."""
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'operation': operation,
+            'data': data
+        }
+        with open(self.transaction_log_path, 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+
+    def _replay_transaction_log(self) -> None:
+        """Replay transaction log for recovery."""
+        if not self.transaction_log_path.exists():
+            return
+
+        with open(self.transaction_log_path, 'r') as f:
+            for line in f:
+                try:
+                    entry = json.loads(line.strip())
+                    if entry['operation'] == 'add':
+                        data = entry['data']
+                        self.index.add_item(
+                            id=data['id'],
+                            vector=np.array(data['vector']),
+                            metadata=data['metadata']
+                        )
+                    elif entry['operation'] == 'remove':
+                        data = entry['data']
+                        self.index.remove_item(data['id'])
+                except Exception as e:
+                    logger.error(f"Error replaying transaction: {e}")
+
+    def _start_auto_save(self) -> None:
+        """Start auto-save thread."""
+        def auto_save():
+            while True:
+                time.sleep(self.auto_save_interval)
+                self.save()
+                self.last_save_time = datetime.now()
+
+        save_thread = threading.Thread(target=auto_save, daemon=True)
+        save_thread.start()
+
+    def clear_file(self, filename: str) -> None:
+        """Remove all items associated with a specific file."""
+        try:
+            # Get all IDs that start with the filename
+            ids_to_remove = [id for id in self.index.get_ids() if id.startswith(filename)]
             
-            if isinstance(vector, list):
-                vector = np.array(vector)
+            # Remove each item
+            for id in ids_to_remove:
+                self.index.remove_item(id)
+                self._log_transaction('remove', {'id': id})
             
-            vectors.append(vector)
-            indices.append(self.current_index)
+            logger.info(f"Cleared all items for file: {filename}")
+        except Exception as e:
+            logger.error(f"Error clearing file {filename}: {e}")
+            raise
+
+    def add_item(self, id: str, vector: np.ndarray, metadata: Dict[str, Any]) -> None:
+        """Add a vector to the store. If item exists, it will be updated."""
+        try:
+            # If item exists, remove it first
+            if id in self.index.get_ids():
+                self.index.remove_item(id)
+                self._log_transaction('remove', {'id': id})
             
-            # Update mappings
-            self.id_to_index[id] = self.current_index
-            self.index_to_id[self.current_index] = id
-            if metadata:
-                self.metadata[id] = metadata
+            # Convert vector to list if it's numpy array, otherwise use as is
+            vector_list = vector.tolist() if isinstance(vector, np.ndarray) else vector
+            self._log_transaction('add', {
+                'id': id,
+                'vector': vector_list,
+                'metadata': metadata
+            })
             
-            self.current_index += 1
-        
-        # Add to index
-        self.index.add_items(
-            np.array(vectors),
-            np.array(indices)
-        )
-        
-        if self.auto_save:
-            self.save()
-    
+            # Convert to numpy array for the index
+            vector_array = np.array(vector)
+            self.index.add_item(id=id, vector=vector_array, metadata=metadata)
+            
+        except Exception as e:
+            logger.error(f"Error adding item: {e}")
+            raise
+
     def search(
         self,
-        query_vector: Union[List[float], np.ndarray],
-        top_k: int = 10,
-        include_vectors: bool = False
-    ) -> List[SearchResult]:
-        """Search for similar vectors.
-        
-        Args:
-            query_vector: Query vector
-            top_k: Number of results to return
-            include_vectors: Whether to include vectors in results
-            
-        Returns:
-            List of SearchResult objects
-        """
-        if isinstance(query_vector, list):
-            query_vector = np.array(query_vector)
-        
-        # Search index
-        scores, indices = self.index.knn_query(query_vector.reshape(1, -1), k=top_k)
-        
-        # Format results
-        results = []
-        for score, idx in zip(scores[0], indices[0]):
-            id = self.index_to_id[idx]
-            metadata = self.metadata.get(id)
-            
-            result = SearchResult(
-                id=id,
-                score=float(score),
-                metadata=metadata
-            )
-            
-            if include_vectors:
-                result.vector = self.get_vector(id).tolist()
-            
-            results.append(result)
-        
-        return results
-    
-    def batch_search(
-        self,
-        query_vectors: List[Union[List[float], np.ndarray]],
-        top_k: int = 10,
-        include_vectors: bool = False
-    ) -> List[List[SearchResult]]:
-        """Search for multiple query vectors in batch.
-        
-        Args:
-            query_vectors: List of query vectors
-            top_k: Number of results to return per query
-            include_vectors: Whether to include vectors in results
-            
-        Returns:
-            List of lists of SearchResult objects
-        """
-        # Convert to numpy arrays
-        query_vectors = [
-            np.array(v) if isinstance(v, list) else v
-            for v in query_vectors
-        ]
-        query_array = np.array(query_vectors)
-        
-        # Search index
-        scores, indices = self.index.knn_query(query_array, k=top_k)
-        
-        # Format results
-        all_results = []
-        for query_scores, query_indices in zip(scores, indices):
-            results = []
-            for score, idx in zip(query_scores, query_indices):
-                id = self.index_to_id[idx]
-                metadata = self.metadata.get(id)
-                
-                result = SearchResult(
-                    id=id,
-                    score=float(score),
-                    metadata=metadata
-                )
-                
-                if include_vectors:
-                    result.vector = self.get_vector(id).tolist()
-                
-                results.append(result)
-            all_results.append(results)
-        
-        return all_results
-    
-    def get_vector(self, id: str) -> np.ndarray:
-        """Get vector by id.
-        
-        Args:
-            id: Vector identifier
-            
-        Returns:
-            Vector as numpy array
-        """
-        if id not in self.id_to_index:
-            raise KeyError(f"No vector found with id {id}")
-        
-        idx = self.id_to_index[id]
-        vector = self.index.get_items([idx])
-        return vector[0]
-    
-    def delete_item(self, id: str) -> None:
-        """Delete item from store.
-        
-        Args:
-            id: Item identifier
-        """
-        if id not in self.id_to_index:
-            raise KeyError(f"No item found with id {id}")
-        
-        idx = self.id_to_index[id]
-        
-        # Mark as deleted in index
-        self.index.mark_deleted(idx)
-        
-        # Remove from mappings
-        del self.id_to_index[id]
-        del self.index_to_id[idx]
-        if id in self.metadata:
-            del self.metadata[id]
-        
-        if self.auto_save:
-            self.save()
-    
-    def save(self) -> None:
-        """Save vector store to disk."""
-        # Save index
-        self.index.save_index(str(self.storage_dir / "hnsw.index"))
-        
-        # Save metadata and mappings
-        with open(self.storage_dir / "metadata.json", "w") as f:
-            json.dump({
-                "metadata": self.metadata,
-                "id_to_index": self.id_to_index,
-                "index_to_id": {str(k): v for k, v in self.index_to_id.items()},
-                "current_index": self.current_index,
-                "dim": self.dim,
-                "distance_metric": self.distance_metric,
-                "ef_construction": self.ef_construction,
-                "M": self.M
-            }, f)
-    
-    def _load_if_exists(self) -> None:
-        """Load vector store from disk if it exists."""
-        index_path = self.storage_dir / "hnsw.index"
-        metadata_path = self.storage_dir / "metadata.json"
-        
-        if not (index_path.exists() and metadata_path.exists()):
-            return
-        
-        # Load metadata and mappings
-        with open(metadata_path) as f:
-            data = json.load(f)
-            self.metadata = data["metadata"]
-            self.id_to_index = {k: int(v) for k, v in data["id_to_index"].items()}
-            self.index_to_id = {int(k): v for k, v in data["index_to_id"].items()}
-            self.current_index = data["current_index"]
-        
-        # Load index
-        self.index.load_index(str(index_path))
-    
-    def backup(self, backup_dir: str) -> None:
-        """Create backup of vector store.
-        
-        Args:
-            backup_dir: Directory to store backup
-        """
-        backup_path = Path(backup_dir)
-        backup_path.mkdir(parents=True, exist_ok=True)
-        
-        # Save current state
-        self.save()
-        
-        # Copy files to backup directory
-        shutil.copytree(
-            self.storage_dir,
-            backup_path / self.storage_dir.name,
-            dirs_exist_ok=True
-        )
-    
-    def restore(self, backup_dir: str) -> None:
-        """Restore vector store from backup.
-        
-        Args:
-            backup_dir: Directory containing backup
-        """
-        backup_path = Path(backup_dir)
-        if not backup_path.exists():
-            raise ValueError(f"Backup directory {backup_dir} does not exist")
-        
-        # Copy files from backup
-        shutil.rmtree(self.storage_dir, ignore_errors=True)
-        shutil.copytree(
-            backup_path / self.storage_dir.name,
-            self.storage_dir,
-            dirs_exist_ok=True
-        )
-        
-        # Reload data
-        self._load_if_exists()
-    
-    @contextmanager
-    def transaction(self) -> Iterator[Transaction]:
-        """Create transaction for batch operations.
-        
-        Usage:
-            with store.transaction() as txn:
-                txn.add_item("id1", vector1, metadata1)
-                txn.delete_item("id2")
-        """
-        txn = Transaction(operations=[], timestamp=time.time(), status="in_progress")
-        
+        query_vector: np.ndarray,
+        k: int = 10,
+        filter_func: Optional[Callable[[Dict[str, Any]], bool]] = None
+    ) -> List[Tuple[float, str, Dict[str, Any]]]:
+        """Search for similar vectors with optional filtering."""
         try:
-            yield txn
-            txn.status = "committed"
-            if self.auto_save:
-                self.save()
-        except Exception:
-            txn.status = "rolled_back"
+            results = self.index.search(query_vector, k=k)
+            
+            # Add metadata and apply filter
+            filtered_results = []
+            for dist, id in results:
+                metadata = self.index.nodes[id].metadata
+                if not filter_func or filter_func(metadata):
+                    filtered_results.append((dist, id, metadata))
+            
+            return filtered_results[:k]
+            
+        except Exception as e:
+            logger.error(f"Error searching: {e}")
+            raise
+
+    def save(self) -> None:
+        """Save vector store state."""
+        try:
+            # Save index data
+            with open(self.data_path, 'wb') as f:
+                pickle.dump(self.index, f)
+            
+            # Save metadata
+            metadata = {
+                'last_save': datetime.now().isoformat(),
+                'num_items': len(self.index.nodes),
+                'dim': self.index.dim,
+                'distance_metric': self.index.distance_metric
+            }
+            with open(self.metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            # Clear transaction log
+            if self.transaction_log_path.exists():
+                self.transaction_log_path.unlink()
+            
+            logger.info("Vector store saved successfully")
+            
+        except Exception as e:
+            logger.error(f"Error saving vector store: {e}")
+            raise
+
+    def load(self) -> None:
+        """Load vector store state."""
+        try:
+            with open(self.data_path, 'rb') as f:
+                self.index = pickle.load(f)
+            logger.info("Vector store loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading vector store: {e}")
+            raise
+
+    def backup(self, backup_dir: Optional[str] = None) -> None:
+        """Create a backup of the vector store."""
+        try:
+            # Save current state
+            self.save()
+            
+            # Create backup directory
+            backup_path = Path(backup_dir) if backup_dir else self.storage_dir / f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            backup_path.mkdir(parents=True, exist_ok=True)
+            
+            # Copy files to backup
+            shutil.copy2(self.data_path, backup_path / self.data_path.name)
+            shutil.copy2(self.metadata_path, backup_path / self.metadata_path.name)
+            
+            logger.info(f"Backup created at {backup_path}")
+            
+        except Exception as e:
+            logger.error(f"Error creating backup: {e}")
+            raise
+
+    def restore(self, backup_dir: str) -> None:
+        """Restore vector store from backup."""
+        try:
+            backup_path = Path(backup_dir)
+            
+            # Copy backup files to main storage
+            shutil.copy2(backup_path / self.data_path.name, self.data_path)
+            shutil.copy2(backup_path / self.metadata_path.name, self.metadata_path)
+            
+            # Load the restored data
+            self.load()
+            
+            logger.info(f"Restored from backup at {backup_path}")
+            
+        except Exception as e:
+            logger.error(f"Error restoring from backup: {e}")
             raise

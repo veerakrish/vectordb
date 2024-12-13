@@ -274,13 +274,14 @@ class VectorStore:
     def _initialize_storage(self) -> None:
         """Initialize storage and recover if necessary."""
         try:
-            if self.data_path.exists():
+            if self.data_path.exists() and self.data_path.stat().st_size > 0:
                 self.load()
             if self.transaction_log_path.exists():
                 self._replay_transaction_log()
         except Exception as e:
             logger.error(f"Error initializing storage: {e}")
-            raise
+            # If there's an error loading, start with a fresh index
+            self.index = HNSWIndex(dim=self.index.dim, distance_metric=self.index.distance_metric)
 
     def _log_transaction(self, operation: str, data: Dict[str, Any]) -> None:
         """Log transaction for recovery."""
@@ -420,10 +421,10 @@ class VectorStore:
         try:
             with open(self.data_path, 'rb') as f:
                 self.index = pickle.load(f)
-            logger.info("Vector store loaded successfully")
-        except Exception as e:
+        except (EOFError, pickle.UnpicklingError) as e:
             logger.error(f"Error loading vector store: {e}")
-            raise
+            # If there's an error loading, start with a fresh index
+            self.index = HNSWIndex(dim=self.index.dim, distance_metric=self.index.distance_metric)
 
     def backup(self, backup_dir: Optional[str] = None) -> None:
         """Create a backup of the vector store."""

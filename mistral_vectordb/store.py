@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional, Callable
 import numpy as np
 import heapq
-import time  # <--- Added the missing time module import
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +40,26 @@ class HNSWIndex:
         self.distance_metric = distance_metric
         self.nodes: Dict[str, Node] = {}
         self.entry_point: Optional[str] = None
-        self.lock = threading.Lock()
+        self._lock = None  # Will be initialized in __getstate__
+        self._init_lock()
     
+    def _init_lock(self):
+        """Initialize the thread lock."""
+        self._lock = threading.Lock()
+    
+    def __getstate__(self):
+        """Custom state for pickling."""
+        state = self.__dict__.copy()
+        # Don't pickle the lock
+        state['_lock'] = None
+        return state
+    
+    def __setstate__(self, state):
+        """Custom state for unpickling."""
+        self.__dict__.update(state)
+        # Recreate the lock
+        self._init_lock()
+
     def _distance(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
         """Calculate distance between two vectors."""
         if self.distance_metric == "cosine":
@@ -61,7 +78,7 @@ class HNSWIndex:
 
     def add_item(self, id: str, vector: np.ndarray, metadata: Dict[str, Any]) -> None:
         """Add an item to the index."""
-        with self.lock:
+        with self._lock:
             if len(vector.shape) != 1 or vector.shape[0] != self.dim:
                 raise ValueError(f"Vector dimension mismatch. Expected {self.dim}, got {vector.shape}")
             
@@ -144,11 +161,12 @@ class HNSWIndex:
 
     def get_ids(self) -> List[str]:
         """Get all item IDs in the index."""
-        return list(self.nodes.keys())
+        with self._lock:
+            return list(self.nodes.keys())
 
     def remove_item(self, id: str) -> None:
         """Remove an item from the index."""
-        with self.lock:
+        with self._lock:
             if id not in self.nodes:
                 return
             
@@ -176,53 +194,54 @@ class HNSWIndex:
 
     def search(self, query_vector: np.ndarray, k: int = 10) -> List[Tuple[float, str]]:
         """Search for k nearest neighbors."""
-        if not self.entry_point:
-            return []
-        
-        # Start from entry point
-        curr_node_id = self.entry_point
-        curr_dist = self._distance(query_vector, self.nodes[curr_node_id].vector)
-        
-        # Search from top to bottom
-        for layer in range(len(self.nodes[self.entry_point].neighbors), -1, -1):
-            while True:
-                changed = False
-                
-                # Check neighbors at current layer
-                curr_node = self.nodes[curr_node_id]
-                if layer in curr_node.neighbors:
-                    for neighbor_id in curr_node.neighbors[layer]:
-                        if neighbor_id not in self.nodes:
-                            continue
-                        dist = self._distance(query_vector, self.nodes[neighbor_id].vector)
-                        if dist < curr_dist:
-                            curr_node_id = neighbor_id
-                            curr_dist = dist
-                            changed = True
-                
-                if not changed:
-                    break
-        
-        # Collect k nearest neighbors
-        candidates = [(curr_dist, curr_node_id)]
-        visited = {curr_node_id}
-        results = []
-        
-        while candidates and len(results) < k:
-            dist, curr_id = heapq.heappop(candidates)
-            results.append((dist, curr_id))
+        with self._lock:
+            if not self.entry_point:
+                return []
             
-            # Add unvisited neighbors
-            curr_node = self.nodes[curr_id]
-            for layer in curr_node.neighbors:
-                for neighbor_id in curr_node.neighbors[layer]:
-                    if neighbor_id in visited or neighbor_id not in self.nodes:
-                        continue
-                    neighbor_dist = self._distance(query_vector, self.nodes[neighbor_id].vector)
-                    heapq.heappush(candidates, (neighbor_dist, neighbor_id))
-                    visited.add(neighbor_id)
-        
-        return results
+            # Start from entry point
+            curr_node_id = self.entry_point
+            curr_dist = self._distance(query_vector, self.nodes[curr_node_id].vector)
+            
+            # Search from top to bottom
+            for layer in range(len(self.nodes[self.entry_point].neighbors), -1, -1):
+                while True:
+                    changed = False
+                    
+                    # Check neighbors at current layer
+                    curr_node = self.nodes[curr_node_id]
+                    if layer in curr_node.neighbors:
+                        for neighbor_id in curr_node.neighbors[layer]:
+                            if neighbor_id not in self.nodes:
+                                continue
+                            dist = self._distance(query_vector, self.nodes[neighbor_id].vector)
+                            if dist < curr_dist:
+                                curr_node_id = neighbor_id
+                                curr_dist = dist
+                                changed = True
+                    
+                    if not changed:
+                        break
+            
+            # Collect k nearest neighbors
+            candidates = [(curr_dist, curr_node_id)]
+            visited = {curr_node_id}
+            results = []
+            
+            while candidates and len(results) < k:
+                dist, curr_id = heapq.heappop(candidates)
+                results.append((dist, curr_id))
+                
+                # Add unvisited neighbors
+                curr_node = self.nodes[curr_id]
+                for layer in curr_node.neighbors:
+                    for neighbor_id in curr_node.neighbors[layer]:
+                        if neighbor_id in visited or neighbor_id not in self.nodes:
+                            continue
+                        neighbor_dist = self._distance(query_vector, self.nodes[neighbor_id].vector)
+                        heapq.heappush(candidates, (neighbor_dist, neighbor_id))
+                        visited.add(neighbor_id)
+            
+            return results
 
 class VectorStore:
     """Vector store with HNSW indexing and persistence."""

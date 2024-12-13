@@ -427,23 +427,181 @@ class VectorStore:
             self.index = HNSWIndex(dim=self.index.dim, distance_metric=self.index.distance_metric)
 
     def backup(self, backup_dir: Optional[str] = None) -> None:
-        """Create a backup of the vector store."""
+        """Create a backup of the vector store.
+        
+        This creates a complete backup including:
+        - vector_store.pkl: The vector store data (all documents)
+        - metadata.json: List of processed files and their hashes
+        - transaction.log: Pending transactions
+        - backup_info.json: Detailed backup information
+        
+        Each backup is stored in a new directory with format:
+        backup_[timestamp]_[files]
+        
+        Example:
+        backup_20241213_1200_document1_document2/
+        
+        Old backups are preserved, not overwritten.
+        
+        Args:
+            backup_dir: Optional directory to store backup in. If None, uses storage_dir.
+        """
         try:
-            # Save current state
+            # First save current state to ensure metadata.json is up to date
             self.save()
             
+            # Generate backup directory name with timestamp and file info
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Get list of unique file names (remove chunk numbers)
+            processed_files = sorted(set(
+                node_id.split('_')[0] 
+                for node_id in self.index.nodes.keys()
+            ))
+            
+            # Create a descriptive backup name
+            file_info = "_".join(processed_files)
+            if len(file_info) > 50:  # Truncate if too long
+                file_info = f"{file_info[:47]}..."
+            backup_name = f"backup_{timestamp}_{file_info}"
+            
+            # Use provided backup dir or create in storage dir
+            if backup_dir:
+                backup_path = Path(backup_dir) / backup_name
+            else:
+                backup_path = self.storage_dir / backup_name
+            
+            # Ensure we're not overwriting an existing backup
+            if backup_path.exists():
+                raise ValueError(f"Backup directory {backup_path} already exists")
+            
             # Create backup directory
-            backup_path = Path(backup_dir) if backup_dir else self.storage_dir / f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             backup_path.mkdir(parents=True, exist_ok=True)
             
-            # Copy files to backup
-            shutil.copy2(self.data_path, backup_path / self.data_path.name)
-            shutil.copy2(self.metadata_path, backup_path / self.metadata_path.name)
+            # Copy all essential files to backup
+            files_to_backup = [
+                (self.data_path, "vector_store.pkl"),
+                (self.metadata_path, "metadata.json"),
+                (self.transaction_log_path, "transaction.log")
+            ]
             
-            logger.info(f"Backup created at {backup_path}")
+            for src_path, backup_name in files_to_backup:
+                if src_path.exists():
+                    dst_path = backup_path / backup_name
+                    shutil.copy2(src_path, dst_path)
+                    logger.info(f"Backed up {src_path.name} ({src_path.stat().st_size} bytes)")
+            
+            # Save detailed backup information
+            backup_info = {
+                'backup_time': timestamp,
+                'files_included': processed_files,
+                'vector_store_size': self.data_path.stat().st_size if self.data_path.exists() else 0,
+                'num_vectors': len(self.index.nodes),
+                'processed_files': {
+                    node_id: {
+                        'file': node_id.split('_')[0],
+                        'metadata': node.metadata,
+                        'last_modified': datetime.now().isoformat()
+                    }
+                    for node_id, node in self.index.nodes.items()
+                }
+            }
+            
+            with open(backup_path / "backup_info.json", 'w') as f:
+                json.dump(backup_info, f, indent=2)
+            
+            logger.info(f"Created new backup at {backup_path}")
+            logger.info(f"Backup contains {len(processed_files)} files:")
+            for file in processed_files:
+                logger.info(f"  - {file}")
+            logger.info(f"Total vectors: {len(self.index.nodes)}")
             
         except Exception as e:
             logger.error(f"Error creating backup: {e}")
+            raise
+
+    def list_backups(self) -> List[Dict[str, Any]]:
+        """List all available backups with their contents.
+        
+        Returns:
+            List of dictionaries containing backup information:
+            - backup_dir: Path to backup directory
+            - timestamp: When backup was created
+            - files: List of files in the backup
+            - num_vectors: Number of vectors in the backup
+        """
+        backups = []
+        backup_dirs = [d for d in self.storage_dir.iterdir() 
+                      if d.is_dir() and d.name.startswith('backup_')]
+        
+        for backup_dir in sorted(backup_dirs, reverse=True):  # Most recent first
+            try:
+                info_file = backup_dir / "backup_info.json"
+                if info_file.exists():
+                    with open(info_file, 'r') as f:
+                        info = json.load(f)
+                        backups.append({
+                            'backup_dir': str(backup_dir),
+                            'timestamp': info.get('backup_time', ''),
+                            'files': info.get('files_included', []),
+                            'num_vectors': info.get('num_vectors', 0),
+                            'processed_files': info.get('processed_files', {})
+                        })
+            except Exception as e:
+                logger.error(f"Error reading backup {backup_dir}: {e}")
+                continue
+        
+        return backups
+
+    def load_specific_files(self, backup_dir: str, files_to_load: List[str]) -> None:
+        """Load specific files from a backup.
+        
+        Args:
+            backup_dir: Path to backup directory
+            files_to_load: List of file names to load
+        """
+        try:
+            backup_path = Path(backup_dir)
+            if not backup_path.exists():
+                raise ValueError(f"Backup directory {backup_dir} does not exist")
+            
+            # Load backup info
+            with open(backup_path / "backup_info.json", 'r') as f:
+                backup_info = json.load(f)
+                available_files = backup_info.get('files_included', [])
+                
+                # Verify all requested files are in the backup
+                missing_files = [f for f in files_to_load if f not in available_files]
+                if missing_files:
+                    raise ValueError(f"Files not in backup: {', '.join(missing_files)}")
+            
+            # Load the vector store data
+            with open(backup_path / "vector_store.pkl", 'rb') as f:
+                backup_index = pickle.load(f)
+            
+            # Create a new index with only the requested files
+            new_index = HNSWIndex(dim=self.index.dim, distance_metric=self.index.distance_metric)
+            loaded_files = set()
+            
+            # Copy only the vectors for requested files
+            for node_id, node in backup_index.nodes.items():
+                file_name = node_id.split('_')[0]  # Get base filename
+                if file_name in files_to_load:
+                    new_index.nodes[node_id] = node
+                    loaded_files.add(file_name)
+            
+            # Update the current index
+            self.index = new_index
+            
+            # Save the new state
+            self.save()
+            
+            logger.info(f"Successfully loaded {len(loaded_files)} files from backup")
+            for file in loaded_files:
+                logger.info(f"  - {file}")
+            
+        except Exception as e:
+            logger.error(f"Error loading files from backup: {e}")
             raise
 
     def restore(self, backup_dir: str) -> None:
@@ -452,8 +610,8 @@ class VectorStore:
             backup_path = Path(backup_dir)
             
             # Copy backup files to main storage
-            shutil.copy2(backup_path / self.data_path.name, self.data_path)
-            shutil.copy2(backup_path / self.metadata_path.name, self.metadata_path)
+            shutil.copy2(backup_path / "vector_store.pkl", self.data_path)
+            shutil.copy2(backup_path / "metadata.json", self.metadata_path)
             
             # Load the restored data
             self.load()

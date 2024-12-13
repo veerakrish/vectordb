@@ -90,6 +90,68 @@ with store.transaction() as txn:
     txn.delete_item("doc2")
 ```
 
+## Backup Management
+
+The vector store includes comprehensive backup management features:
+
+### Creating Backups
+
+```python
+# Create a backup with automatic naming (timestamp + files)
+store.backup()
+
+# Create a backup in a specific directory
+store.backup(backup_dir="/path/to/backup")
+```
+
+### Listing Backups
+
+```python
+# Get list of all available backups
+backups = store.list_backups()
+
+# View backup information
+for backup in backups:
+    print(f"Backup Time: {backup['timestamp']}")
+    print(f"Files: {backup['files']}")
+    print(f"Vectors: {backup['num_vectors']}")
+```
+
+### Loading Specific Files
+
+```python
+# Load specific files from a backup
+store.load_specific_files(
+    backup_dir="/path/to/backup",
+    files_to_load=["document1.pdf", "document2.pdf"]
+)
+```
+
+### Full Restore
+
+```python
+# Restore entire vector store from backup
+store.restore(backup_dir="/path/to/backup")
+```
+
+Each backup contains:
+- `vector_store.pkl`: The vector store data
+- `metadata.json`: File metadata and hashes
+- `transaction.log`: Transaction history
+- `backup_info.json`: Backup metadata
+
+Backups are stored in timestamped directories:
+```
+backup_20241213_1200_document1_document2/
+```
+
+Features:
+- Incremental backups
+- File-level granularity
+- Detailed backup metadata
+- Safe restore operations
+- Backup verification
+
 ## API Reference
 
 ### VectorStore
@@ -153,6 +215,18 @@ class VectorStore:
 
     def restore(self, backup_dir: str) -> None:
         """Restore vector store from backup."""
+        ...
+
+    def list_backups(self) -> List[Dict]:
+        """Get list of all available backups."""
+        ...
+
+    def load_specific_files(
+        self,
+        backup_dir: str,
+        files_to_load: List[str]
+    ) -> None:
+        """Load specific files from a backup."""
         ...
 ```
 

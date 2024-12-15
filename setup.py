@@ -40,7 +40,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="mistral-vectordb",
-    version="0.5.0",  # Updated version for document processing and security features
+    version="1.0.0",  # Major version release with security features
     description="High-performance vector database with secure storage, advanced document processing, and RAG features",
     author="viswanath veera krishna maddinala",
     author_email="veerukhannan@gmail.com",
@@ -53,75 +53,45 @@ setup(
         'develop': PostDevelopCommand,
     },
     install_requires=[
-        "numpy>=1.19.0",
-        "requests>=2.25.0",
-        "tqdm>=4.65.0",
-        "python-dotenv>=0.19.0",
-        "streamlit>=1.24.0",
-        "hnswlib>=0.7.0",
-        "spacy>=3.0.0",
-        "sentence-transformers>=2.2.0",
-        "rank_bm25>=0.2.2",
-        "scikit-learn>=1.0.0",
-        "cachetools>=5.0.0",
-        "mistralai>=0.0.7",
-        # API Server
-        "fastapi>=0.68.0",
-        "uvicorn>=0.15.0",
-        "python-jose[cryptography]>=3.3.0",
-        "python-multipart>=0.0.5",
-        # Rate limiting and monitoring
-        "slowapi>=0.1.4",
-        "prometheus-client>=0.12.0",
-        "psutil>=5.8.0",
-        "authlib>=1.0.0",
-        "starlette>=0.14.2",
-        # Document processing
-        "PyMuPDF>=1.18.0",  # PDF processing
-        "python-docx>=0.8.11",  # Word documents
-        "beautifulsoup4>=4.9.3",  # HTML processing
-        "pandas>=1.3.0",  # Spreadsheet processing
-        "openpyxl>=3.0.7",  # Excel support
-        "pytesseract>=0.3.8",  # OCR
-        "tika>=1.24",  # General document parsing
-        "python-magic>=0.4.24",  # File type detection
-        "Pillow>=8.0.0",  # Image processing
-        # Security
-        "cryptography>=35.0.0",  # Encryption
-        "bcrypt>=3.2.0",  # Password hashing
-        "keyring>=24.0.0",  # For secure API key storage
-    ],
-    python_requires=">=3.7",
-    classifiers=[
-        "Development Status :: 4 - Beta",
-        "Intended Audience :: Developers",
-        "License :: OSI Approved :: MIT License",
-        "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
-        "Topic :: Scientific/Engineering :: Artificial Intelligence",
-        "Topic :: Software Development :: Libraries :: Python Modules",
-        "Topic :: Security :: Cryptography",
-        "Topic :: Text Processing :: Indexing",
-        "Operating System :: OS Independent",
+        'numpy>=1.19.0',
+        'fastapi>=0.68.0',
+        'uvicorn>=0.15.0',
+        'python-jose[cryptography]>=3.3.0',
+        'python-multipart>=0.0.5',
+        'requests>=2.26.0',
+        'pydantic>=1.8.0',
+        'PyYAML>=5.4.1',
+        'cryptography>=3.4.7',
+        'python-dateutil>=2.8.2',
+        'aiohttp>=3.8.0',
+        'prometheus-client>=0.12.0',
+        'psutil>=5.8.0',
     ],
     extras_require={
-        "dev": [
-            "pytest>=7.0.0",
-            "black>=22.0.0",
-            "isort>=5.0.0",
-            "mypy>=0.900",
-            "flake8>=4.0.0",
-        ],
-        "gpu": [
-            "torch>=1.8.0",
-            "tensorflow>=2.4.0",
+        'dev': [
+            'pytest>=6.2.5',
+            'black>=21.9b0',
+            'isort>=5.9.3',
+            'flake8>=3.9.2',
+            'mypy>=0.910',
         ],
     },
+    classifiers=[
+        'Development Status :: 5 - Production/Stable',
+        'Intended Audience :: Developers',
+        'License :: OSI Approved :: MIT License',
+        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Topic :: Software Development :: Libraries :: Python Modules',
+        'Topic :: Database',
+        'Topic :: Security',
+    ],
+    python_requires='>=3.8',
     entry_points={
         'console_scripts': [
-            'mistral-vectordb-setup=mistral_vectordb.setup_tool:setup_mistral_vectordb',
+            'vectordb-server=mistral_vectordb.server.api:run_server',
         ],
     },
 )
